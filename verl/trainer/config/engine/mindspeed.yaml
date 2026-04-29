@@ -1,11 +1,15 @@
 # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
 _target_: verl.workers.config.MindSpeedEngineConfig
 
-# mindspeed_llm or mindspeed_mm
-strategy: mindspeed_llm
+  # mindspeed_megatron or mindspeed_fsdp
+strategy: mindspeed_fsdp
 
-llm_kwargs:
-  # mindspeed_llm model config
+# should be supported model name
+model_name: qwen3.5-27b
+
+# mindspeed_megatron backend config
+mcore_kwargs:
+  # llm model config
   use_mcore_models: true
   spec: []
   qk_layernorm: true
@@ -25,7 +29,7 @@ llm_kwargs:
   context_parallel_algo: ulysses_cp_algo
   attention_mask_type: general
 
-  # mindspeed_llm optimizer config
+  # llm optimizer config
   use_flash_attn: true
   use_fused_rotary_pos_emb: true
   sequence_parallel: true
@@ -35,11 +39,43 @@ llm_kwargs:
   no_masked_softmax_fusion: true
   use_distributed_optimizer: true
 
-  # mindspeed_llm train config
+  # llm train config
   seq_length: 10240
   micro_batch_size: 1
   initial_loss_scale: 4096
   init_method_std: 0.01
   hidden_dropout: 0.0
 
-mm_kwargs: {}
+# mindspeed_fsdp backend config
+fsdp_kwargs:
+  parallel:
+    tensor_parallel_size: 1
+    fully_shard_parallel_size: auto
+    fsdp_plan:
+      param_dtype: bf16
+      reduce_dtype: fp32
+    ulysses_parallel_size: 1 # when open ulysses-cp, please set attn_implementation: flash_attention_2
+
+  model:
+    trust_remote_code: true
+    attn_implementation: sdpa
+    loss_cfg:
+      loss_type: default   # If you want raw loss in model, loss_type can be set to "raw".
+      router_aux_loss_coef: 0.0
+    enable_chunk_loss: false
+    chunkloss_plan:
+      apply_module: lm_head
+      chunk_size: 1024
+
+  training:
+    micro_batch_size: 1
+    gradient_accumulation_steps: 1
+    init_model_with_meta_device: true
+    adam_fused: true
+    no_load_optim: true  # Do not load optimizer state; remove if loading is needed.
+    no_load_rng: true  # Do not load RNG state; remove if loading is needed.
+    no_save_optim: true  # Do not save optimizer state; remove if saving is needed.
+    no_save_rng: true  # Do not save RNG state; remove if saving is needed.
+    use_deter_comp: false
+    load_rank0_and_broadcast: true
+

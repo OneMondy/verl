@@ -17,7 +17,19 @@ import argparse
 
 import torch
 
-from verl.workers.config import HFModelConfig, McoreOptimizerConfig, MindSpeedEngineConfig
+from verl.workers.config import (
+    HFModelConfig,
+    MindSpeedOptimizerConfig,
+    MindSpeedEngineConfig,
+)
+
+MCORE_SUPPORT_LLM_MODELS = ["qwen3-moe-30b", "qwen3-32b", "qwen3-8b"]
+
+MCORE_SUPPORT_MM_MODELS = []
+
+FSDP_SUPPORT_LLM_MODELS = []
+
+FSDP_SUPPORT_MM_MODELS = ["qwen3.5-27b", "qwen3.5-35b"]
 
 
 def get_base_mcore_config_from_model_config(model_config: HFModelConfig) -> dict:
@@ -30,6 +42,7 @@ def get_base_mcore_config_from_model_config(model_config: HFModelConfig) -> dict
     Returns:
         TransformerConfig with common parameters
     """
+    from verl.models.mcore.config_converter import get_hf_rope_theta
 
     hf_config = model_config.hf_config
     base_config = {
@@ -47,7 +60,7 @@ def get_base_mcore_config_from_model_config(model_config: HFModelConfig) -> dict
         "tie_word_embeddings": hf_config.tie_word_embeddings,
         "torch_dtype": hf_config.torch_dtype,
         "bf16": hf_config.dtype is torch.bfloat16,
-        "rotary_base": int(hf_config.rope_theta),
+        "rotary_base": get_hf_rope_theta(hf_config),
         "num_experts": getattr(hf_config, "num_experts", None),
         "moe_router_topk": getattr(hf_config, "num_experts_per_tok", None),
         "moe_ffn_hidden_size": getattr(hf_config, "moe_intermediate_size", None),
@@ -86,19 +99,17 @@ def get_base_mcore_config_from_engine_config(engine_config: MindSpeedEngineConfi
         "use_distributed_optimizer": engine_config.use_distributed_optimizer,
         "seed": engine_config.seed,
     }
-    if engine_config.strategy == "mindspeed_llm":
-        base_config.update(engine_config.llm_kwargs)
-    elif engine_config.strategy == "mindspeed_mm":
-        base_config.update(engine_config.mm_kwargs)
+
+    base_config.update(engine_config.mcore_kwargs)
     return base_config
 
 
-def get_base_mcore_config_from_optim_config(optim_config: McoreOptimizerConfig) -> dict:
+def get_base_mcore_config_from_optim_config(optim_config: MindSpeedOptimizerConfig) -> dict:
     """
     Create a base TransformerConfig with common parameters across different model architectures.
 
     Args:
-        optim_config: megatron optimizer configuration
+        optim_config: mindspeed optimizer configuration
 
     Returns:
         TransformerConfig with common parameters
@@ -115,7 +126,8 @@ def get_base_mcore_config_from_optim_config(optim_config: McoreOptimizerConfig) 
         "adam_beta2": optim_config.betas[1],
     }
 
-    base_config.update(optim_config.override_optimizer_config)
+    if optim_config.override_optimizer_config is not None:
+        base_config.update(optim_config.override_optimizer_config)
     return base_config
 
 
@@ -221,3 +233,63 @@ def gpt_model_provider(pre_process=True, post_process=True):
     )
 
     return model
+
+
+def get_fsdp_trainer(model_config: HFModelConfig, engine_config: MindSpeedEngineConfig,
+                     optim_config: MindSpeedOptimizerConfig):
+    from mindspeed_mm.fsdp.train.trainer import Trainer
+    from mindspeed_mm.fsdp.params.argument import Arguments
+    from mindspeed_mm.fsdp.params.utils import instantiate_dataclass
+
+    # default data config
+    engine_config.fsdp_kwargs["data"] = {
+        "dataset_param": {
+            "dataset_type": "huggingface",
+        },
+        "dataloader_param": {
+            "pin_memory": True,
+            "shuffle": False,
+            "dataloader_mode": "sampler",
+            "drop_last": True,
+            "sampler_type": "BaseRandomBatchSampler",
+            "collate_param": {
+                "model_name": "qwen3vl",
+            },
+        },
+    }
+
+    mm_args = instantiate_dataclass(Arguments, engine_config.fsdp_kwargs)
+    if engine_config.offload_policy or engine_config.forward_only:
+        mm_args.parallel.fsdp_plan.cpu_offload = True
+    else:
+        mm_args.parallel.fsdp_plan.cpu_offload = False
+
+    mm_args.model.model_name_or_path = model_config.path
+
+    # parse training config
+    mm_args.training.seed = engine_config.seed
+    mm_args.training.lr = optim_config.lr
+    mm_args.training.lr_decay_style = optim_config.lr_decay_style
+    mm_args.training.lr_warmup_ratio = optim_config.lr_warmup_ratio
+    mm_args.training.weight_decay = optim_config.weight_decay
+    mm_args.training.clip_grad = optim_config.clip_grad
+    mm_args.training.optimizer = optim_config.optimizer
+    mm_args.training.compute_distributed_training(mm_args.parallel)
+
+    def dataloader_provider(args=None):
+        return None
+
+    trainer = Trainer(args=mm_args, dataloader_provider=dataloader_provider)
+    if trainer.train_dataloader is not None:
+        trainer.train_dataloader = None
+    return trainer, mm_args
+
+
+def move_buffers_to_device_recursive(model, device):
+    def _move_buffers(t):
+        if not isinstance(t, torch.nn.Parameter):
+            return t.to(device)
+        else:
+            return t
+
+    return model._apply(_move_buffers, recurse=True)

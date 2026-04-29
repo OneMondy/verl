@@ -59,7 +59,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
-from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
+from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs, is_vision_language_model
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import (
@@ -748,7 +748,8 @@ class FSDPEngine(BaseEngine):
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
-        load_fsdp_model_to_gpu(self.module)
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.module)
 
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
@@ -885,6 +886,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
+        is_vlm_model = is_vision_language_model(self.module)
 
         if not isinstance(temperature, torch.Tensor):
             temperature = torch.tensor([temperature] * input_ids.shape[0], device=input_ids.device)
@@ -894,7 +896,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         # args used to get outputs
         output_args = {}
-
+        input_ids_rmpad_rolled_for_model = None
+        
         if use_remove_padding:
             # support per sample temperature
             # temperature (bsz,)
@@ -942,7 +945,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 )
 
                 output_args["pad_size"] = pad_size
-
+            
+            input_ids_rmpad_rolled_for_model = input_ids_rmpad_rolled
             input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
             temperature_rmpad = temperature_rmpad.squeeze(0)
             output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
@@ -977,9 +981,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 )
 
                 if position_ids.dim() == 3:
+                    rope_dim = position_ids.shape[1]
+                    assert isinstance(rope_dim, int), f"Expected static rope_dim for 3D position_ids, got {rope_dim}"
                     position_ids = torch.nested.to_padded_tensor(
-                        position_ids, padding=0, output_size=(batch_size, 4, max_seq_len)
-                    ).transpose(0, 1)  # (4, batch_size, max_seq_len)
+                        position_ids, padding=0, output_size=(batch_size, rope_dim, max_seq_len)
+                    ).transpose(0, 1)  # (rope_dim, batch_size, max_seq_len)
                 else:
                     position_ids = torch.nested.to_padded_tensor(
                         position_ids, padding=0, output_size=(batch_size, max_seq_len)
@@ -1004,6 +1010,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
         if use_fused_kernels:
             extra_args["temperature"] = temperature_item
             extra_args["return_dict"] = True
+            if use_remove_padding and self.use_ulysses_sp and is_vlm_model:
+                # VLM Ulysses slices sequences after embedding, so the model must consume
+                # labels that are already shifted and sliced to the local shard.
+                assert input_ids_rmpad_rolled_for_model is not None
+                extra_args["labels"] = input_ids_rmpad_rolled_for_model
 
         model_inputs.update(multi_modal_inputs)
         model_inputs.update(extra_args)
